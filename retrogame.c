@@ -68,6 +68,20 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <linux/uinput.h>
 
 
+
+
+
+struct {
+	int pin;
+	int key;
+} io[] = {
+//	  Input    Output (from /usr/include/linux/input.h)
+	
+	{ 21,      KEY_VOLUMEUP       },
+	{ 17,      KEY_VOLUMEDOWN     }
+};
+
+
 // START HERE ------------------------------------------------------------
 // This table remaps GPIO inputs to keyboard values.  In this initial
 // implementation there's a 1:1 relationship (can't attach multiple keys
@@ -78,20 +92,43 @@ POSSIBILITY OF SUCH DAMAGE.
 // and have unused GPIO pins, set the corresponding key value to GND to
 // create a spare ground point.
 
+#define max_encoders 8
 #define GND -1
-struct {
-	int pin;
-	int key;
-} io[] = {
-//	  Input    Output (from /usr/include/linux/input.h)
-	{ 25,      KEY_LEFT     },
-	{  9,      KEY_RIGHT    },
-	{ 10,      KEY_UP       },
-	{ 17,      KEY_DOWN     },
-	{ 23,      KEY_LEFTCTRL },
-	{  7,      KEY_LEFTALT  }
-};
+#define BCM2708_PERI_BASE 0x20000000
+#define GPIO_BASE         (BCM2708_PERI_BASE + 0x200000)
+#define BLOCK_SIZE        (4*1024)
+#define GPPUD             (0x94 / 4)
+#define GPPUDCLK0         (0x98 / 4)
+
+
+
+
 #define IOLEN (sizeof(io) / sizeof(io[0])) // io[] table size
+
+
+
+struct encoder
+{
+    int pin_a;
+    int pin_b;
+    int pin_a_value;
+    int pin_b_value;
+    volatile long value;
+    volatile int lastEncoded;
+};
+
+//Pre-allocate encoder objects on the stack so we don't have to 
+//worry about freeing them
+struct encoder encoders[max_encoders];
+
+/*
+  Should be run for every rotary encoder you want to control
+  Returns a pointer to the new rotary encoder structer
+  The pointer will be NULL is the function failed for any reason
+*/
+
+
+
 
 
 // A few globals ---------------------------------------------------------
@@ -104,7 +141,67 @@ volatile unsigned int
   *gpio;                             // GPIO register table
 
 
+// A few arrays here are declared with IOLEN elements, even though
+	// values aren't needed for io[] members where the 'key' value is
+	// GND.  This simplifies the code a bit -- no need for mallocs and
+	// tests to create these arrays -- but may waste a handful of
+	// bytes for any declared GNDs.
+	char                   buf[50],         // For sundry filenames
+	                       c;               // Pin input value ('0'/'1')
+	int                    fd,              // For mmap, sysfs, uinput
+	                       i, j,            // Asst. counter
+	                       bitmask,         // Pullup enable bitmask
+	                       timeout = -1,    // poll() timeout
+	                       intstate[IOLEN], // Last-read state
+	                       extstate[IOLEN]; // Debounced state
+	volatile unsigned char shortWait;       // Delay counter
+	struct uinput_user_dev uidev;           // uinput device
+	
+    struct input_event     keyEv, synEv;    // uinput events
+    struct uinput_user_dev uidev;           // uinput device
+	struct pollfd          p[IOLEN];        // GPIO file descriptors
+
+
+    
+// FUNCTIONS
+void setup_uinput();
+void setupGPIO();
+struct encoder *setupencoder(int pin_a, int pin_b); 
+    
 // Some utility functions ------------------------------------------------
+
+struct encoder *setupencoder(int pin_a, int pin_b)
+{
+    
+    struct encoder *newencoder = encoders;
+    newencoder->pin_a = pin_a;
+    newencoder->pin_b = pin_b;
+    newencoder->pin_a_value = 0;
+    newencoder->pin_b_value = 0;    
+    newencoder->value = 0;
+    newencoder->lastEncoded = 0;
+    return newencoder;
+}
+
+
+int updateEncoder(struct encoder *encoder)
+{
+   
+    
+        int MSB = encoder->pin_a_value;
+        int LSB = encoder->pin_b_value;
+
+        int encoded = (MSB << 1) | LSB;
+        int sum = (encoder->lastEncoded << 2) | encoded;
+
+        encoder->lastEncoded = encoded;
+        
+        if(sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) return -1;
+        if(sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) return 1;
+
+        return 0;
+    
+}
 
 // Set one GPIO pin attribute through the Sysfs interface.
 int pinConfig(int pin, char *attr, char *value) {
@@ -152,38 +249,114 @@ void signalHandler(int n) {
 
 // Main stuff ------------------------------------------------------------
 
-#define BCM2708_PERI_BASE 0x20000000
-#define GPIO_BASE         (BCM2708_PERI_BASE + 0x200000)
-#define BLOCK_SIZE        (4*1024)
-#define GPPUD             (0x94 / 4)
-#define GPPUDCLK0         (0x98 / 4)
+
 
 int main(int argc, char *argv[]) {
 
-	// A few arrays here are declared with IOLEN elements, even though
-	// values aren't needed for io[] members where the 'key' value is
-	// GND.  This simplifies the code a bit -- no need for mallocs and
-	// tests to create these arrays -- but may waste a handful of
-	// bytes for any declared GNDs.
-	char                   buf[50],         // For sundry filenames
-	                       c;               // Pin input value ('0'/'1')
-	int                    fd,              // For mmap, sysfs, uinput
-	                       i, j,            // Asst. counter
-	                       bitmask,         // Pullup enable bitmask
-	                       timeout = -1,    // poll() timeout
-	                       intstate[IOLEN], // Last-read state
-	                       extstate[IOLEN]; // Debounced state
-	volatile unsigned char shortWait;       // Delay counter
-	struct uinput_user_dev uidev;           // uinput device
-	struct input_event     keyEv, synEv;    // uinput events
-	struct pollfd          p[IOLEN];        // GPIO file descriptors
 
+    struct encoder *encoder = setupencoder(21,17);
+
+	
 	progName = argv[0];             // For error reporting
 	signal(SIGINT , signalHandler); // Trap basic signals (exit cleanly)
 	signal(SIGKILL, signalHandler);
 
 
+	
+    setupGPIO();
+
 	// ----------------------------------------------------------------
+	// Set up uinput
+
+	setup_uinput();
+
+	// 'fd' is now open file descriptor for issuing uinput events
+
+
+	// ----------------------------------------------------------------
+	// Monitor GPIO file descriptors for button events.  The poll()
+	// function watches for GPIO IRQs in this case; it is NOT
+	// continually polling the pins!  Processor load is near zero.
+    int a=0,b=0;
+    int state=0;
+    int count=0;
+    
+	while(running) { // Signal handler can set this to 0 to exit
+		// Wait for IRQ on pin (or timeout for button debounce)
+		
+        
+        if(poll(p, 2, timeout) > 0) { // If IRQ...           
+            lseek(p[0].fd, 0, SEEK_SET);
+            read(p[0].fd, &a, 1);
+            lseek(p[1].fd, 0, SEEK_SET);
+            read(p[1].fd, &b, 1);
+            encoder->pin_a_value=49-a;
+            encoder->pin_b_value=49-b;
+            state=1;
+            //we get 3 values for each position
+            if (count==2)
+            {
+                //the sum of the inputs will be either negative or positive.
+                intstate[0]+=updateEncoder(encoder);
+                count=0;
+            }
+            count++;
+
+            
+
+			timeout = 10; // Set timeout for debounce
+		} else  { 
+            c=0;
+            if(state != 0 ) {
+                if (intstate[0]<0)
+                {
+                    keyEv.code=io[0].key;
+                    //printf("key down\n");
+                    c=1;
+                }
+                if (intstate[0]>0)
+                {
+                    keyEv.code=io[1].key; 
+                    //printf("key up\n");
+                    c=1; 
+                }
+                if (c)
+                {
+                    keyEv.value = 1;
+                    write(fd, &keyEv, sizeof(keyEv));                       
+                    keyEv.value = 0;
+                    write(fd, &keyEv, sizeof(keyEv));
+                    write(fd, &synEv, sizeof(synEv));
+                }
+                
+                extstate[0] = intstate[0];
+                intstate[0]=0;                 
+                state=0;
+                
+             
+            }
+
+           
+            c=0;
+            timeout = -1; // Return to normal IRQ monitoring
+		}
+	}
+
+	// ----------------------------------------------------------------
+	// Clean up
+
+	ioctl(fd, UI_DEV_DESTROY); // Destroy and
+	close(fd);                 // close uinput
+	cleanup();                 // Un-export pins
+
+	puts("Done.");
+
+	return 0;
+}
+
+void setupGPIO()
+{
+// ----------------------------------------------------------------
 	// Although Sysfs provides solid GPIO interrupt handling, there's
 	// no interface to the internal pull-up resistors (this is by
 	// design, being a hardware-dependent feature).  It's necessary to
@@ -256,12 +429,11 @@ int main(int argc, char *argv[]) {
 		}
 	} // 'j' is now count of non-GND items in io[] table
 	close(fd); // Done exporting
-
-
-	// ----------------------------------------------------------------
-	// Set up uinput
-
-	if((fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK)) < 0)
+}
+void setup_uinput() 
+{
+    int i=0;
+    if((fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK)) < 0)
 		err("Can't open /dev/uinput");
 	if(ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0)
 		err("Can't SET_EVBIT");
@@ -288,65 +460,4 @@ int main(int argc, char *argv[]) {
 	synEv.type  = EV_SYN;
 	synEv.code  = SYN_REPORT;
 	synEv.value = 0;
-
-	// 'fd' is now open file descriptor for issuing uinput events
-
-
-	// ----------------------------------------------------------------
-	// Monitor GPIO file descriptors for button events.  The poll()
-	// function watches for GPIO IRQs in this case; it is NOT
-	// continually polling the pins!  Processor load is near zero.
-
-	while(running) { // Signal handler can set this to 0 to exit
-		// Wait for IRQ on pin (or timeout for button debounce)
-		if(poll(p, j, timeout) > 0) { // If IRQ...
-			for(i=0; i<j; i++) {       // Scan non-GND pins...
-				if(p[i].revents) { // Event received?
-					// Read current pin state, store
-					// in internal state flag, but
-					// don't issue to uinput yet --
-					// must wait for debounce!
-					lseek(p[i].fd, 0, SEEK_SET);
-					read(p[i].fd, &c, 1);
-					if(c == '0')      intstate[i] = 1;
-					else if(c == '1') intstate[i] = 0;
-					p[i].revents = 0; // Clear flag
-				}
-			}
-			timeout = 20; // Set timeout for debounce
-		} else { // Else timeout occurred; input is debounced
-			// 'j' (number of non-GNDs) is re-counted as
-			// it's easier than maintaining an additional
-			// remapping table or a duplicate key[] list.
-			for(c=i=j=0; i<IOLEN; i++) {
-				if(io[i].key != GND) {
-					// Compare internal state against
-					// previously-issued value.  Send
-					// keystrokes only for changed states.
-					if(intstate[j] != extstate[j]) {
-						extstate[j] = intstate[j];
-						keyEv.code  = io[i].key;
-						keyEv.value = intstate[j];
-						write(fd, &keyEv,
-						  sizeof(keyEv));
-						c = 1; // Follow w/SYN event
-					}
-					j++;
-				}
-			}
-			if(c) write(fd, &synEv, sizeof(synEv));
-			timeout = -1; // Return to normal IRQ monitoring
-		}
-	}
-
-	// ----------------------------------------------------------------
-	// Clean up
-
-	ioctl(fd, UI_DEV_DESTROY); // Destroy and
-	close(fd);                 // close uinput
-	cleanup();                 // Un-export pins
-
-	puts("Done.");
-
-	return 0;
 }
